@@ -1,165 +1,189 @@
 #!/usr/bin/env python3
 """
-generateFiles.py — probe IBKR TLDs with pinning & build Chrome extension.
+generateFiles.py — Probes IBKR TLDs, pins certs, builds Chrome extension ZIP.
 
-Usage:
-  python generateFiles.py [--timeoutSeconds FLOAT] [--workerCount INT]
-                          [--includeExtended] [--buildExtension]
-                          [--extensionDir PATH] [--zipOutput PATH]
+1. Probes TLDs for DNS/TLS/HTTP and outputs a summary.
+2. Only ibkr.eu and interactivebrokers.com are trusted cert CNs.
+3. Builds Chrome extension with manifest.json at root.
 """
-import argparse, os, socket, ssl, json, zipfile, shutil, warnings
+
+import argparse, os, json, zipfile, socket, ssl, shutil
+import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tabulate import tabulate
-from urllib3.exceptions import InsecureRequestWarning, NotOpenSSLWarning
+from urllib3.exceptions import InsecureRequestWarning
+import warnings
 
 warnings.simplefilter("ignore", InsecureRequestWarning)
-warnings.simplefilter("ignore", NotOpenSSLWarning)
 
-try:
-    from PIL import Image, ImageDraw
-    HAS_PIL = True
-except ImportError:
-    HAS_PIL = False
-    import base64
-
-# ─── CONFIG ────────────────────────────────────────────────────────────
-PINNED_CNS = {"ibkr.eu", "interactivebrokers.com", "www.interactivebrokers.com"}
-KNOWN_TLDS = sorted(["com","co.uk","ee","eu","ch","de","es","fr","ie","it","lu"])
+PINNED_CNS = ["ibkr.eu", "interactivebrokers.com"]
+TRUSTED_TLDS = [
+    "ch", "co.uk", "com", "de", "ee", "es", "eu", "fr", "ie", "it", "lu"
+]
 EXTENDED_TLDS = sorted([
-  "ad","al","am","at","az","ba","bg","by","cy","cz","dk","fo","ge","gi","gr",
-  "hr","hu","im","is","je","li","lt","lv","mc","md","me","mk","mt","nl","no",
-  "pl","pt","ro","rs","se","si","sk","tr","ua","va"
+    "ad","al","am","at","az","ba","bg","by","cy","cz","dk","fo","ge","gi","gr",
+    "hr","hu","il","im","is","je","li","lt","lv","mc","md","me","mk","mt","nl",
+    "no","pl","pt","ro","rs","se","si","sk","tr","ua","va"
 ])
-EXT_NAME        = "BrokerSiteHelper"
-EXT_VERSION     = "1.0.0"
-EXT_DESCRIPTION = "Auto-select IE entity & reject cookies on Interactive Brokers EU/IE."
-# ────────────────────────────────────────────────────────────────────────
 
 def get_cert_cn(domain, timeout):
     try:
         ctx = ssl.create_default_context()
         with ctx.wrap_socket(socket.socket(), server_hostname=domain) as s:
             s.settimeout(timeout)
-            s.connect((domain,443))
+            s.connect((domain, 443))
             cert = s.getpeercert()
-        for part in cert.get("subject",()):
-            for k,v in part:
-                if k.lower()=="commonname": return v
-    except: pass
+        for part in cert.get("subject", ()):
+            for k, v in part:
+                if k.lower() == "commonname":
+                    return v
+    except Exception:
+        return None
     return None
 
 def probe(domain, timeout):
-    cn = get_cert_cn(domain, timeout)
-    if not cn: return domain, "-", False, "DNS/TLS error"
-    if cn in PINNED_CNS: return domain, cn, True, "TLS pinning OK"
-    return domain, cn, False, f"untrusted CN: {cn}"
-
-def build_extension(dir_out):
-    # clean
-    if os.path.isdir(dir_out): shutil.rmtree(dir_out)
-    os.makedirs(os.path.join(dir_out,"icons"), exist_ok=True)
-
-    # draw icon.png (48×48)
-    ico = os.path.join(dir_out,"icons","icon.png")
-    if HAS_PIL:
-        img = Image.new("RGBA",(48,48),(29,101,189,255))
-        d = ImageDraw.Draw(img)
-        # arrow
-        d.rectangle([8,22,32,26], fill="white")
-        d.polygon([(32,18),(44,24),(32,30)], fill="white")
-        # cookie
-        cx,cy,r = 36,36,10
-        d.ellipse([cx-r,cy-r,cx+r,cy+r], fill=(210,180,140,255))
-        for dx,dy in [(-4,-4),(4,-2),(-2,4)]:
-            d.ellipse([cx+dx-2,cy+dy-2,cx+dx+2,cy+dy+2], fill=(139,69,19,255))
-        img.save(ico)
+    res = {
+        "domain": domain,
+        "cert_cn": None,
+        "status": None,
+        "final_url": None,
+        "result": "FAIL",
+        "reason": "",
+        "scope": ""
+    }
+    tld = domain.split('.', 1)[1]
+    res["scope"] = "TRUSTED" if tld in TRUSTED_TLDS else "EXTENDED"
+    cert_cn = get_cert_cn(domain, timeout)
+    res["cert_cn"] = cert_cn
+    try:
+        r = requests.get(f"https://{domain}/", timeout=timeout, allow_redirects=True)
+        res["status"] = r.status_code
+        res["final_url"] = r.url
+    except requests.exceptions.ConnectionError as e:
+        msg = str(e).lower()
+        if "name or service not known" in msg or "failed to resolve" in msg:
+            res["reason"] = "no dns"
+        elif "refused" in msg:
+            res["reason"] = "connection refused"
+        elif "reset by peer" in msg:
+            res["reason"] = "connection reset"
+        else:
+            res["reason"] = "connection error"
+        return res
+    except requests.exceptions.Timeout:
+        res["reason"] = "timeout"
+        return res
+    except requests.exceptions.SSLError:
+        res["reason"] = "tls handshake failed"
+        return res
+    except Exception:
+        res["reason"] = "request error"
+        return res
+    # Cert validation
+    if cert_cn in PINNED_CNS:
+        res["result"] = "PASS"
+        res["reason"] = "certificate pinned"
+    elif cert_cn:
+        res["reason"] = f"untrusted cert: {cert_cn}"
     else:
-        with open(ico,"wb") as f:
-            f.write(base64.b64decode(
-              "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAA"
-              "AAC0lEQVR42mP8/w8AAgMBgGO216sAAAAASUVORK5CYII="))
+        res["reason"] = "no tls available"
+    return res
 
-    # manifest.json
-    hosts = [f"*://*.interactivebrokers.{t}/*" for t in KNOWN_TLDS]
+def build_extension(extension_path):
+    if os.path.isdir(extension_path):
+        shutil.rmtree(extension_path)
+    os.makedirs(os.path.join(extension_path, "icons"), exist_ok=True)
+    # Minimal icon: 48x48 px PNG (redirect arrow with a cookie)
+    from PIL import Image, ImageDraw
+    img = Image.new("RGBA", (48, 48), (255, 255, 255, 0))
+    d = ImageDraw.Draw(img)
+    # Arrow
+    d.line((6, 24, 38, 24), fill=(31, 120, 225, 255), width=8)
+    d.polygon([(32,20),(38,24),(32,28)], fill=(31,120,225,255))
+    # Cookie
+    d.ellipse((12,32,28,44), fill=(200,170,100,255), outline="saddlebrown", width=3)
+    d.ellipse((17,36,19,38), fill="saddlebrown")
+    d.ellipse((22,39,24,41), fill="saddlebrown")
+    d.ellipse((25,35,27,37), fill="saddlebrown")
+    img.save(os.path.join(extension_path, "icons", "icon.png"))
+    # Manifest
+    trusted_hosts = [f"*://*.interactivebrokers.{tld}/*" for tld in TRUSTED_TLDS]
     manifest = {
-      "manifest_version":3,
-      "name":EXT_NAME,
-      "version":EXT_VERSION,
-      "description":EXT_DESCRIPTION,
-      "permissions":["scripting"],
-      "host_permissions":hosts,
-      "icons":{"48":"icons/icon.png"},
-      "content_scripts":[{
-        "matches":hosts,
-        "js":["content.js"],
-        "run_at":"document_idle"
-      }]
+        "manifest_version": 3,
+        "name": "BrokerSiteHelper",
+        "version": "1.0.0",
+        "description": "Auto-select IE entity & reject cookies on Interactive Brokers EU/IE.",
+        "permissions": [ "scripting" ],
+        "host_permissions": trusted_hosts,
+        "icons": { "48": "icons/icon.png" },
+        "content_scripts": [{
+            "matches": trusted_hosts,
+            "js": [ "content.js" ],
+            "run_at": "document_idle"
+        }]
     }
-    with open(os.path.join(dir_out,"manifest.json"),"w") as f:
-        json.dump(manifest,f,indent=2)
-
-    # content.js
+    with open(os.path.join(extension_path, "manifest.json"), "w") as f:
+        json.dump(manifest, f, indent=2)
+    # Content script
     js = """(() => {
-  const click = toks => {
+  const action = () => {
     for (const el of document.querySelectorAll('button,a')) {
-      const t=el.textContent.trim().toLowerCase();
-      if (toks.includes(t)){ el.click(); return; }
+      const t = el.textContent.trim().toLowerCase();
+      if (t==='go to ie website'){el.click();return;}
+      if (['reject all cookies','reject cookies','ablehnen'].includes(t)){el.click();return;}
     }
-    return false;
   };
-  const act = () => {
-    click(['go to ie website']);
-    click(['reject all cookies','reject cookies','ablehnen']);
-  };
-  act();
-  const o=new MutationObserver(act);
+  action();
+  const o = new MutationObserver(action);
   o.observe(document.body,{childList:true,subtree:true});
   setTimeout(()=>o.disconnect(),15000);
 })();"""
-    with open(os.path.join(dir_out,"content.js"),"w") as f:
+    with open(os.path.join(extension_path, "content.js"), "w") as f:
         f.write(js)
 
-def zip_extension(src, dst):
-    with zipfile.ZipFile(dst,"w") as z:
-        for root,_,files in os.walk(src):
-            for name in files:
-                full = os.path.join(root,name)
-                z.write(full, os.path.relpath(full, src))
+def zipdir(basedir, zipfile_path):
+    # Zips CONTENTS of basedir, not the dir itself
+    with zipfile.ZipFile(zipfile_path, "w", zipfile.ZIP_DEFLATED) as zipf:
+        for root, _, files in os.walk(basedir):
+            for file in files:
+                full = os.path.join(root, file)
+                rel = os.path.relpath(full, basedir)
+                zipf.write(full, rel)
 
 def main():
-    p=argparse.ArgumentParser(description=__doc__,
-       formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("-t","--timeoutSeconds", type=float, default=5.0)
-    p.add_argument("-w","--workerCount",   type=int, default=10)
-    p.add_argument("--includeExtended", action="store_true")
-    p.add_argument("--buildExtension", action="store_true")
-    p.add_argument("--extensionDir", default="dist/extension")
-    p.add_argument("--zipOutput",   default="dist/brokersitehelper.zip")
-    args = p.parse_args()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--timeout", type=float, default=5.0)
+    parser.add_argument("--workers", type=int, default=10)
+    parser.add_argument("--includeExtended", action="store_true")
+    parser.add_argument("--buildExtension", action="store_true")
+    parser.add_argument("--extensionDir", default="dist/extension")
+    parser.add_argument("--zipOutput", default="dist/brokersitehelper.zip")
+    args = parser.parse_args()
 
-    tlds = KNOWN_TLDS + (EXTENDED_TLDS if args.includeExtended else [])
-    domains = [f"interactivebrokers.{t}" for t in tlds]
+    # Sorted: TRUSTED first, then EXTENDED (alpha)
+    domains = [f"interactivebrokers.{tld}" for tld in sorted(TRUSTED_TLDS)] + (
+        [f"interactivebrokers.{tld}" for tld in EXTENDED_TLDS] if args.includeExtended else []
+    )
 
-    results=[]
-    with ThreadPoolExecutor(max_workers=args.workerCount) as ex:
-        futs={ex.submit(probe,d,args.timeoutSeconds):d for d in domains}
-        for f in as_completed(futs):
-            domain,cn,ok,reason=f.result()
-            scope = "KNOWN" if domain.split(".",1)[1] in KNOWN_TLDS else "EXTENDED"
-            results.append((scope,domain,cn,"PASS" if ok else "FAIL",reason))
+    print("Probing domains...\n")
+    results = []
+    with ThreadPoolExecutor(max_workers=args.workers) as ex:
+        futs = {ex.submit(probe, d, args.timeout): d for d in domains}
+        for fut in as_completed(futs):
+            r = fut.result()
+            results.append(r)
+            print(f"{r['scope']} {r['domain']:28s} {r['cert_cn'] or 'NO_CERT':24s} {r['result']:4s}: {r['reason']}")
 
-    results.sort(key=lambda r:(0 if r[0]=="KNOWN" else 1, r[1]))
-    print(tabulate(results,
-      headers=["SCOPE","DOMAIN","CN","RESULT","REASON"], tablefmt="github"))
+    # Summary table
+    table = [[r["scope"], r["domain"], r["cert_cn"] or "NO_CERT", r["result"], r["reason"]] for r in results]
+    print("\n"+tabulate(table, headers=["SCOPE","DOMAIN","CN","RESULT","REASON"], tablefmt="github"))
 
     if args.buildExtension:
+        print(f"\nBuilding extension in {args.extensionDir}/ …")
         build_extension(args.extensionDir)
-        os.makedirs(os.path.dirname(args.zipOutput),exist_ok=True)
-        zip_extension(args.extensionDir,args.zipOutput)
-        # sanity‐check
-        print("\nZIP contents:")
-        print(os.popen(f"unzip -l {args.zipOutput}").read())
-        print(f"→ extension ZIP is {args.zipOutput}")
+        os.makedirs(os.path.dirname(args.zipOutput), exist_ok=True)
+        zipdir(args.extensionDir, args.zipOutput)
+        print(f"Extension ZIP created at {args.zipOutput}")
 
-if __name__=="__main__":
+if __name__ == "__main__":
     main()

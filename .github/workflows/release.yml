@@ -1,63 +1,38 @@
-name: Build & Release Extension
+name: Build & Release Chrome Extension
 
 on:
   push:
-    branches:
-      - main
     tags:
       - 'v*'
-  workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    outputs:
-      zip-path: ${{ steps.build.outputs.zip-path }}
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repo
+        uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.x'
+          python-version: '3.11'
 
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
+      - name: Install Python dependencies
+        run: pip install pillow tabulate requests
 
       - name: Build extension ZIP
-        id: build
-        run: |
-          python generateFiles.py --includeExtended --buildExtension
-          echo "zip-path=dist/brokersitehelper.zip" >> $GITHUB_OUTPUT
+        run: python generateFiles.py --includeExtended --buildExtension
 
-      - name: Upload build artifact
-        uses: actions/upload-artifact@v4
+      - name: Check extension ZIP contents
+        run: unzip -l dist/brokersitehelper.zip
+
+      - name: Upload built ZIP to release
+        uses: softprops/action-gh-release@v1
         with:
-          name: extension-zip
-          path: ${{ steps.build.outputs.zip-path }}
-
-  release:
-    needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Download build artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: extension-zip
-
-      - name: Move and flatten ZIP
-        run: |
-          mv dist/brokersitehelper.zip brokersitehelper.zip
-          ls -l brokersitehelper.zip
-
-      - name: Publish GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: brokersitehelper.zip
+          files: dist/brokersitehelper.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
