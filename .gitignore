@@ -1,0 +1,20 @@
+# macOS cruft
+.DS_Store
+
+# build artifacts
+dist/
+*.zip
+*.log
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+.venv/
+env/
+venv/
+
+# VSCode
+.vscode/
